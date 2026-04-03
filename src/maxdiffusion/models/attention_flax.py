@@ -27,7 +27,6 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 from einops import rearrange
 from .. import common_types, max_logging
-from .exp2_splash_attention import exp2_flash_attention, Exp2BlockSizes
 
 from . import quantizations
 
@@ -393,87 +392,6 @@ def _apply_attention_dot(
   return hidden_states
 
 
-def _tpu_exp2_flash_attention(
-    query: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    heads: int,
-    scale: float,
-    mesh: Mesh,
-    axis_names_q: AxisNames,
-    axis_names_kv: AxisNames,
-    flash_block_sizes: BlockSizes,
-    dtype: jnp.dtype = jnp.float32,
-) -> jax.Array:
-  """TPU Flash Attention with exp2 optimization.
-
-  Uses a custom Pallas kernel that replaces exp with exp2 in the softmax
-  computation. Query is pre-multiplied by LOG2_E * scale to enable this.
-  """
-  query = _reshape_data_for_flash(query, heads)
-  key = _reshape_data_for_flash(key, heads)
-  value = _reshape_data_for_flash(value, heads)
-  q_axis_names = nn.logical_to_mesh_axes(axis_names_q)
-  kv_axis_names = nn.logical_to_mesh_axes(axis_names_kv)
-
-  # Configure exp2 block sizes
-  if flash_block_sizes and hasattr(flash_block_sizes, 'block_q'):
-    exp2_blocks = Exp2BlockSizes(
-        block_q=flash_block_sizes.block_q,
-        block_kv=flash_block_sizes.block_kv,
-        block_kv_compute=flash_block_sizes.block_kv_compute or flash_block_sizes.block_kv,
-    )
-  else:
-    exp2_blocks = Exp2BlockSizes()
-
-  @functools.partial(
-      shard_map.shard_map,
-      mesh=mesh,
-      in_specs=(q_axis_names, kv_axis_names, kv_axis_names),
-      out_specs=q_axis_names,
-      check_rep=False,
-  )
-  def wrap_exp2_attention(query, key, value):
-    query, kv_size, query_seq_len = _pad_data_for_flash(
-        query, heads, exp2_blocks.block_q
-    )
-    key, _, key_seq_len = _pad_data_for_flash(
-        key, heads, exp2_blocks.block_kv
-    )
-    value, _, _ = _pad_data_for_flash(
-        value, heads, exp2_blocks.block_kv
-    )
-
-    # Create segment IDs for padding masking
-    q_padded_len = query.shape[2]
-    q_indices = jax.lax.broadcasted_iota(jnp.int32, (q_padded_len,), 0)
-    q_segment_ids = (q_indices < query_seq_len).astype(jnp.int32)
-
-    kv_padded_len = key.shape[2]
-    kv_indices = jax.lax.broadcasted_iota(jnp.int32, (kv_padded_len,), 0)
-    kv_segment_ids = (kv_indices < key_seq_len).astype(jnp.int32)
-
-    # Run exp2 kernel (scale is applied inside via LOG2_E pre-multiplication)
-    attention_output = jax.vmap(
-        lambda q, k, v: exp2_flash_attention(
-            q, k, v, scale=scale,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
-            block_sizes=exp2_blocks,
-        ),
-        in_axes=(0, 0, 0),
-    )(query, key, value)
-
-    # Unpad
-    attention_output = attention_output[:, :, :query_seq_len, :]
-    if kv_size < 128:
-      attention_output = attention_output[:, :, :, :kv_size]
-    return attention_output
-
-  out = wrap_exp2_attention(query, key, value)
-  return _reshape_heads_to_head_dim(out)
-
-
 def _cudnn_flash_attention(query: Array, key: Array, value: Array, heads: int, mesh: Mesh, dpa_layer: Callable) -> Array:
   """CUDNN Flash Attention with Transformer Engine.
   1. Stable API, supports GQA
@@ -531,7 +449,7 @@ def _apply_attention(
   seq_len_idx = 1
   if query.ndim == 4:
     seq_len_idx = 2
-  if attention_kernel in ("flash", "exp2_flash"):
+  if attention_kernel == "flash":
     can_use_flash_attention = (
         query.shape[seq_len_idx] >= flash_min_seq_length
         and key.shape[seq_len_idx] >= flash_min_seq_length
@@ -559,19 +477,6 @@ def _apply_attention(
   elif attention_kernel == "ring":
     return _tpu_flash_attention(
         query, key * scale, value, heads, mesh, axis_names_q, axis_names_kv, flash_block_sizes, dtype, attention_kernel
-    )
-  elif attention_kernel == "exp2_flash":
-    return _tpu_exp2_flash_attention(
-        query,
-        key,
-        value,
-        heads,
-        scale,
-        mesh,
-        axis_names_q,
-        axis_names_kv,
-        flash_block_sizes,
-        dtype,
     )
   elif attention_kernel == "cudnn_flash_te":
     return _cudnn_flash_attention(query, key, value, heads, mesh, dpa_layer)
