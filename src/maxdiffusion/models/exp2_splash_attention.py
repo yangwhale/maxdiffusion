@@ -291,9 +291,8 @@ def _exp2_splash_attention_forward(
             out_specs=out_specs,
             grid=grid,
         ),
-        compiler_params=pltpu.TPUCompilerParams(
+        compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary"),
-            flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
         ),
         out_shape=out_shapes,
     )(*inputs)
